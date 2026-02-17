@@ -169,6 +169,28 @@ class BrowserSession:
         except Exception as e:
             return False, f"Save failed: {e}"
 
+    def force_disconnect(self) -> None:
+        """Immediately drop all session references and close the browser in the background.
+
+        Called when a stuck JS operation blocks the CDP command queue and Playwright
+        can no longer issue commands. Clears state so get_page() starts fresh on the
+        next call, then fires a background task to actually close the browser.
+        """
+        browser, pw = self._browser, self._playwright
+        self._browser = self._context = self._page = self._playwright = None
+        if browser:
+            async def _close() -> None:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+                if pw:
+                    try:
+                        await pw.stop()
+                    except Exception:
+                        pass
+            asyncio.create_task(_close())
+
     async def close(self) -> None:
         """Close Chromium, saving storage state first."""
         if self._context:
@@ -244,7 +266,11 @@ class BrowserNavigateTool(Tool):
                 asyncio.create_task(self._session.save_storage_state())
             return f"Navigated to {url}"
         except Exception as e:
-            logger.error("browser_navigate {}: {}: {}", url, type(e).__name__, e)
+            if "timeout" in type(e).__name__.lower():
+                logger.warning("browser_navigate: timeout — force-disconnecting browser")
+                self._session.force_disconnect()
+            else:
+                logger.error("browser_navigate {}: {}: {}", url, type(e).__name__, e)
             return f"Error: {type(e).__name__}: {e}"
 
 
@@ -304,7 +330,11 @@ class BrowserSnapshotTool(Tool):
             )
             return result or "No interactive elements found."
         except Exception as e:
-            logger.error("browser_snapshot: {}: {}", type(e).__name__, e)
+            if "timeout" in type(e).__name__.lower():
+                logger.warning("browser_snapshot: timeout — force-disconnecting browser")
+                self._session.force_disconnect()
+            else:
+                logger.error("browser_snapshot: {}: {}", type(e).__name__, e)
             return f"Error: {type(e).__name__}: {e}"
 
 
@@ -347,7 +377,11 @@ class BrowserContentTool(Tool):
                 text = text[:_CONTENT_MAX_CHARS] + f"\n\n[...truncated — {len(text)} chars total]"
             return text or "(no text content)"
         except Exception as e:
-            logger.error("browser_content: {}: {}", type(e).__name__, e)
+            if "timeout" in type(e).__name__.lower():
+                logger.warning("browser_content: timeout — force-disconnecting browser")
+                self._session.force_disconnect()
+            else:
+                logger.error("browser_content: {}: {}", type(e).__name__, e)
             return f"Error: {type(e).__name__}: {e}"
 
 
@@ -381,7 +415,11 @@ class BrowserClickTool(Tool):
             await page.locator(f'[data-nanobot-ref="{ref}"]').first.click()
             return f"Clicked ref {ref}"
         except Exception as e:
-            logger.error("browser_click ref={}: {}: {}", ref, type(e).__name__, e)
+            if "timeout" in type(e).__name__.lower():
+                logger.warning("browser_click: timeout — force-disconnecting browser")
+                self._session.force_disconnect()
+            else:
+                logger.error("browser_click ref={}: {}: {}", ref, type(e).__name__, e)
             return f"Error: {type(e).__name__}: {e}"
 
 
@@ -424,7 +462,11 @@ class BrowserTypeTool(Tool):
                 await el.press("Enter")
             return f"Typed into ref {ref}" + (" and pressed Enter." if submit else ".")
         except Exception as e:
-            logger.error("browser_type ref={}: {}: {}", ref, type(e).__name__, e)
+            if "timeout" in type(e).__name__.lower():
+                logger.warning("browser_type: timeout — force-disconnecting browser")
+                self._session.force_disconnect()
+            else:
+                logger.error("browser_type ref={}: {}: {}", ref, type(e).__name__, e)
             return f"Error: {type(e).__name__}: {e}"
 
 
@@ -459,7 +501,11 @@ class BrowserPressTool(Tool):
             await page.keyboard.press(k)
             return f"Pressed {k!r}"
         except Exception as e:
-            logger.error("browser_press key={!r}: {}: {}", key, type(e).__name__, e)
+            if "timeout" in type(e).__name__.lower():
+                logger.warning("browser_press: timeout — force-disconnecting browser")
+                self._session.force_disconnect()
+            else:
+                logger.error("browser_press key={!r}: {}: {}", key, type(e).__name__, e)
             return f"Error: {type(e).__name__}: {e}"
 
 
