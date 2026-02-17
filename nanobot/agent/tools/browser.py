@@ -55,15 +55,10 @@ except ImportError:
 
 def _validate_url(url: str) -> tuple[bool, str]:
     """Return (True, '') if url is a valid http/https URL, else (False, reason)."""
-    try:
-        p = urlparse(url)
-        if p.scheme not in ("http", "https"):
-            return False, f"Only http/https allowed, got '{p.scheme or 'none'}'"
-        if not p.netloc:
-            return False, "Missing domain"
-        return True, ""
-    except Exception as e:
-        return False, str(e)
+    p = urlparse(url)
+    if p.scheme not in ("http", "https"):
+        return False, f"Only http/https allowed, got '{p.scheme or 'none'}'"
+    return (True, "") if p.netloc else (False, "Missing domain")
 
 
 def _resolve_proxy(proxy_server: str) -> str:
@@ -176,14 +171,10 @@ class BrowserSession:
 
     async def close(self) -> None:
         """Close Chromium, saving storage state first."""
-        if self._context and self._storage_state_path:
-            try:
-                path = Path(self._storage_state_path).resolve()
-                path.parent.mkdir(parents=True, exist_ok=True)
-                await self._context.storage_state(path=str(path))
-                path.chmod(0o600)
-            except Exception as e:
-                logger.warning("Browser: storage state save on close failed: {}", e)
+        if self._context:
+            ok, msg = await self.save_storage_state()
+            if not ok and msg.startswith("Save failed"):
+                logger.warning("Browser: save on close: {}", msg)
 
         if self._browser:
             await self._browser.close()
