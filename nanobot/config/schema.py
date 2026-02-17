@@ -226,10 +226,20 @@ class MCPServerConfig(BaseModel):
     url: str = ""  # HTTP: streamable HTTP endpoint URL
 
 
+class BrowserToolConfig(BaseModel):
+    """Browser automation tool configuration (Playwright). Optional; requires [browser] extra."""
+    enabled: bool = False
+    headless: bool = True
+    timeout_ms: int = 30000
+    proxy_server: str = ""
+    storage_state_path: str = ""
+
+
 class ToolsConfig(BaseModel):
     """Tools configuration."""
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
+    browser: BrowserToolConfig = Field(default_factory=BrowserToolConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
