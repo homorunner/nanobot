@@ -168,6 +168,44 @@ class FeishuChannel(BaseChannel):
         logger.info("Feishu bot started with WebSocket long connection")
         logger.info("No public IP required - using WebSocket to receive events")
         
+        # Send welcome message if welcome_chat_id is configured
+        if self.config.welcome_chat_id:
+            try:
+                welcome_chat_id = self.config.welcome_chat_id
+                receive_id_type = "chat_id" if welcome_chat_id.startswith("oc_") else "open_id"
+                
+                # Get model information from configuration if possible
+                model_info = "Unknown"
+                # Try to get model from agents defaults via environment variable
+                import os
+                model_env = os.getenv("NANOBOT_AGENTS_DEFAULTS_MODEL")
+                if model_env:
+                    model_info = model_env
+                else:
+                    # Try to read from config file
+                    config_path = os.path.expanduser("~/.nanobot/config.json")
+                    if os.path.exists(config_path):
+                        import json
+                        with open(config_path, "r") as f:
+                            config_data = json.load(f)
+                            model_info = config_data.get("agents", {}).get("defaults", {}).get("model", "Unknown")
+                
+                welcome_content = f"🤖 nanobot 已启动\n模型: {model_info}\n时间: {self._get_current_time()}"
+                card = {
+                    "config": {"wide_screen_mode": True},
+                    "elements": self._build_card_elements(welcome_content)
+                }
+                
+                # Send welcome message (no reply_to_message_id)
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None, self._send_message_sync,
+                    receive_id_type, welcome_chat_id, "interactive", json.dumps(card, ensure_ascii=False)
+                )
+                logger.info(f"Welcome message sent to {welcome_chat_id}")
+            except Exception as e:
+                logger.warning(f"Failed to send welcome message: {e}")
+        
         # Keep running until stopped
         while self._running:
             await asyncio.sleep(1)
@@ -347,6 +385,13 @@ class FeishuChannel(BaseChannel):
             logger.error(f"Error uploading file {file_path}: {e}")
             return None
 
+    @staticmethod
+    def _get_current_time() -> str:
+        """Get current local time for welcome message."""
+        import datetime
+        now = datetime.datetime.now()
+        return now.strftime("%Y-%m-%d %H:%M:%S")
+    
     def _send_message_sync(self, receive_id_type: str, receive_id: str, msg_type: str, content: str,
                           reply_to_message_id: str | None = None, reply_in_thread: bool = True) -> bool:
         """Send a single message (text/image/file/interactive) synchronously.
