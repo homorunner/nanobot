@@ -447,7 +447,7 @@ class FeishuChannel(BaseChannel):
             msg_type = message.message_type
             
             # Add reaction to indicate "seen"
-            await self._add_reaction(message_id, "THUMBSUP")
+            await self._add_reaction(message_id, "Get")
             
             # Parse message content
             if msg_type == "text":
