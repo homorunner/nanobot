@@ -174,7 +174,7 @@ class AgentLoop:
             val = next(iter(tc.arguments.values()), None) if tc.arguments else None
             if not isinstance(val, str):
                 return tc.name
-            return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
+            return f'{tc.name}("{val[:64]}…")' if len(val) > 64 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
     async def _run_agent_loop(
@@ -352,6 +352,9 @@ class AgentLoop:
         )
 
         async def _bus_progress(content: str) -> None:
+            if msg.metadata and msg.metadata.get("cron_job_id"):
+                logger.debug(f"Skipping progress message for cron job {msg.metadata.get('cron_job_id')}: {content[:50]}...")
+                return
             await self.bus.publish_outbound(OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id, content=content,
                 metadata=msg.metadata or {},
@@ -519,6 +522,7 @@ Respond with ONLY valid JSON, no markdown fences."""
         channel: str = "cli",
         chat_id: str = "direct",
         on_progress: Callable[[str], Awaitable[None]] | None = None,
+        metadata: dict | None = None,
     ) -> str:
         """
         Process a message directly (for CLI or cron usage).
@@ -529,6 +533,7 @@ Respond with ONLY valid JSON, no markdown fences."""
             channel: Source channel (for tool context routing).
             chat_id: Source chat ID (for tool context routing).
             on_progress: Optional callback for intermediate output.
+            metadata: Optional metadata for the inbound message.
         
         Returns:
             The agent's response.
@@ -538,7 +543,8 @@ Respond with ONLY valid JSON, no markdown fences."""
             channel=channel,
             sender_id="user",
             chat_id=chat_id,
-            content=content
+            content=content,
+            metadata=metadata or {},
         )
         
         response = await self._process_message(msg, session_key=session_key, on_progress=on_progress)
