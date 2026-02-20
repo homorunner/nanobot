@@ -28,6 +28,8 @@ try:
         CreateMessageReactionRequestBody,
         Emoji,
         P2ImMessageReceiveV1,
+        ReplyMessageRequest,
+        ReplyMessageRequestBody,
     )
     FEISHU_AVAILABLE = True
 except ImportError:
@@ -345,26 +347,47 @@ class FeishuChannel(BaseChannel):
             logger.error(f"Error uploading file {file_path}: {e}")
             return None
 
-    def _send_message_sync(self, receive_id_type: str, receive_id: str, msg_type: str, content: str) -> bool:
-        """Send a single message (text/image/file/interactive) synchronously."""
+    def _send_message_sync(self, receive_id_type: str, receive_id: str, msg_type: str, content: str,
+                          reply_to_message_id: str | None = None, reply_in_thread: bool = True) -> bool:
+        """Send a single message (text/image/file/interactive) synchronously.
+        
+        If reply_to_message_id is provided, the message will be sent as a reply.
+        reply_in_thread controls whether the reply appears in a thread (default True).
+        """
         try:
-            request = CreateMessageRequest.builder() \
-                .receive_id_type(receive_id_type) \
-                .request_body(
-                    CreateMessageRequestBody.builder()
-                    .receive_id(receive_id)
-                    .msg_type(msg_type)
-                    .content(content)
-                    .build()
-                ).build()
-            response = self._client.im.v1.message.create(request)
+            if reply_to_message_id:
+                # Send as reply (thread or direct reply)
+                request = ReplyMessageRequest.builder() \
+                    .message_id(reply_to_message_id) \
+                    .request_body(
+                        ReplyMessageRequestBody.builder()
+                        .content(content)
+                        .msg_type(msg_type)
+                        .reply_in_thread(reply_in_thread)
+                        .build()
+                    ).build()
+                response = self._client.im.v1.message.reply(request)
+            else:
+                # Send as new message
+                request = CreateMessageRequest.builder() \
+                    .receive_id_type(receive_id_type) \
+                    .request_body(
+                        CreateMessageRequestBody.builder()
+                        .receive_id(receive_id)
+                        .msg_type(msg_type)
+                        .content(content)
+                        .build()
+                    ).build()
+                response = self._client.im.v1.message.create(request)
+            
             if not response.success():
                 logger.error(
                     f"Failed to send Feishu {msg_type} message: code={response.code}, "
                     f"msg={response.msg}, log_id={response.get_log_id()}"
                 )
                 return False
-            logger.debug(f"Feishu {msg_type} message sent to {receive_id}")
+            logger.debug(f"Feishu {msg_type} message sent to {receive_id}" + 
+                        (f" (reply to {reply_to_message_id}, in_thread={reply_in_thread})" if reply_to_message_id else ""))
             return True
         except Exception as e:
             logger.error(f"Error sending Feishu {msg_type} message: {e}")
@@ -379,6 +402,10 @@ class FeishuChannel(BaseChannel):
         try:
             receive_id_type = "chat_id" if msg.chat_id.startswith("oc_") else "open_id"
             loop = asyncio.get_running_loop()
+            
+            # Extract reply information from metadata
+            reply_to_message_id = msg.metadata.get("message_id") if msg.metadata else None
+            reply_in_thread = msg.metadata.get("reply_in_thread", True) if msg.metadata else True
 
             for file_path in msg.media:
                 if not os.path.isfile(file_path):
@@ -391,6 +418,7 @@ class FeishuChannel(BaseChannel):
                         await loop.run_in_executor(
                             None, self._send_message_sync,
                             receive_id_type, msg.chat_id, "image", json.dumps({"image_key": key}),
+                            reply_to_message_id, reply_in_thread
                         )
                 else:
                     key = await loop.run_in_executor(None, self._upload_file_sync, file_path)
@@ -399,6 +427,7 @@ class FeishuChannel(BaseChannel):
                         await loop.run_in_executor(
                             None, self._send_message_sync,
                             receive_id_type, msg.chat_id, media_type, json.dumps({"file_key": key}),
+                            reply_to_message_id, reply_in_thread
                         )
 
             if msg.content and msg.content.strip():
@@ -406,6 +435,7 @@ class FeishuChannel(BaseChannel):
                 await loop.run_in_executor(
                     None, self._send_message_sync,
                     receive_id_type, msg.chat_id, "interactive", json.dumps(card, ensure_ascii=False),
+                    reply_to_message_id, reply_in_thread
                 )
 
         except Exception as e:
