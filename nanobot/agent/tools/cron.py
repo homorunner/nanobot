@@ -61,6 +61,10 @@ class CronTool(Tool):
                 "job_id": {
                     "type": "string",
                     "description": "Job ID (for remove)"
+                },
+                "deliver": {
+                    "type": "boolean",
+                    "description": "Whether to deliver AI's final response as a message (default: false)"
                 }
             },
             "required": ["action"]
@@ -75,10 +79,11 @@ class CronTool(Tool):
         tz: str | None = None,
         at: str | None = None,
         job_id: str | None = None,
+        deliver: bool = False,
         **kwargs: Any
     ) -> str:
         if action == "add":
-            return self._add_job(message, every_seconds, cron_expr, tz, at)
+            return self._add_job(message, every_seconds, cron_expr, tz, at, deliver)
         elif action == "list":
             return self._list_jobs()
         elif action == "remove":
@@ -92,6 +97,7 @@ class CronTool(Tool):
         cron_expr: str | None,
         tz: str | None,
         at: str | None,
+        deliver: bool = False,
     ) -> str:
         if not message:
             return "Error: message is required for add"
@@ -125,7 +131,7 @@ class CronTool(Tool):
             name=message[:30],
             schedule=schedule,
             message=message,
-            deliver=True,
+            deliver=deliver,
             channel=self._channel,
             to=self._chat_id,
             delete_after_run=delete_after,
