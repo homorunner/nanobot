@@ -42,7 +42,14 @@ class FeishuConfig(Base):
     encrypt_key: str = ""  # Encrypt Key for event subscription (optional)
     verification_token: str = ""  # Verification Token for event subscription (optional)
     allow_from: list[str] = Field(default_factory=list)  # Allowed user open_ids
-    react_emoji: str = "THUMBSUP"  # Emoji type for message reactions (e.g. THUMBSUP, OK, DONE, SMILE)
+    react_emoji: str = ""  # Deprecated: single emoji type (use react_emojis instead)
+    react_emojis: list[str] = Field(
+        default_factory=lambda: [
+            "OK", "THUMBSUP", "THANKS", "APPLAUSE", "JIAYI", "DONE", "YouAreTheBest",
+            "FACEPALM", "SOB", "TOASTED", "TRICK", "Get", "OneSecond", "OnIt", "Yes", "No",
+        ],
+        description="List of emoji types for LLM-picked message reactions",
+    )
 
 
 class DingTalkConfig(Base):

@@ -27,6 +27,7 @@ try:
         CreateMessageReactionRequestBody,
         CreateMessageRequest,
         CreateMessageRequestBody,
+        DeleteMessageReactionRequest,
         Emoji,
         GetMessageResourceRequest,
         P2ImMessageReceiveV1,
@@ -269,7 +270,10 @@ class FeishuChannel(BaseChannel):
         self._ws_thread: threading.Thread | None = None
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
         self._loop: asyncio.AbstractEventLoop | None = None
-
+        # Track "task" reactions (Get/OneSecond/OnIt) that need cleanup after reply
+        # Maps message_id -> (emoji_type, reaction_id)
+        self._pending_task_reactions: dict[str, tuple[str, str]] = {}
+    
     async def start(self) -> None:
         """Start the Feishu bot with WebSocket long connection."""
         if not FEISHU_AVAILABLE:
@@ -337,9 +341,8 @@ class FeishuChannel(BaseChannel):
         """
         self._running = False
         logger.info("Feishu bot stopped")
-
-    def _add_reaction_sync(self, message_id: str, emoji_type: str) -> None:
-        """Sync helper for adding reaction (runs in thread pool)."""
+    def _add_reaction_sync(self, message_id: str, emoji_type: str) -> str | None:
+        """Sync helper for adding reaction (runs in thread pool). Returns reaction_id if successful."""
         try:
             request = CreateMessageReactionRequest.builder() \
                 .message_id(message_id) \
@@ -353,23 +356,210 @@ class FeishuChannel(BaseChannel):
 
             if not response.success():
                 logger.warning("Failed to add reaction: code={}, msg={}", response.code, response.msg)
+                return None
             else:
-                logger.debug("Added {} reaction to message {}", emoji_type, message_id)
+                reaction_id = response.data.reaction_id if response.data else None
+                logger.debug("Added {} reaction to message {} (reaction_id={})", emoji_type, message_id, reaction_id)
+                return reaction_id
         except Exception as e:
             logger.warning("Error adding reaction: {}", e)
+            return None
 
-    async def _add_reaction(self, message_id: str, emoji_type: str = "THUMBSUP") -> None:
+    def _delete_reaction_sync(self, message_id: str, reaction_id: str) -> bool:
+        """Sync helper for deleting a reaction. Returns True if successful."""
+        try:
+            request = DeleteMessageReactionRequest.builder() \
+                .message_id(message_id) \
+                .reaction_id(reaction_id) \
+                .build()
+            
+            response = self._client.im.v1.message_reaction.delete(request)
+            
+            if not response.success():
+                logger.warning("Failed to delete reaction: code={}, msg={}", response.code, response.msg)
+                return False
+            else:
+                logger.debug("Deleted reaction {} from message {}", reaction_id, message_id)
+                return True
+        except Exception as e:
+            logger.warning("Error deleting reaction: {}", e)
+            return False
+
+    async def _add_reaction(self, message_id: str, emoji_type: str = "THUMBSUP") -> str | None:
         """
-        Add a reaction emoji to a message (non-blocking).
-
+        Add a reaction emoji to a message (non-blocking). Returns reaction_id if successful.
+        
         Common emoji types: THUMBSUP, OK, EYES, DONE, OnIt, HEART
         """
         if not self._client or not Emoji:
+            return None
+        
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._add_reaction_sync, message_id, emoji_type)
+
+    async def _delete_reaction(self, message_id: str, reaction_id: str) -> bool:
+        """Delete a reaction from a message (non-blocking)."""
+        if not self._client:
+            return False
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._delete_reaction_sync, message_id, reaction_id)
+
+    async def _pick_and_react(self, message_id: str, message_text: str) -> None:
+        """Use a lightweight LLM call to pick the best reaction emoji, then add it.
+
+        Runs as a fire-and-forget background task so it doesn't block message handling.
+        Falls back to THUMBSUP on any error.
+        
+        For "task" emojis (Get, OneSecond, OnIt), stores the reaction_id so it can
+        be removed later when the reply is sent, and optionally replaced with DONE.
+        """
+        import random
+
+        # Emojis that indicate "working on it" — should be cleaned up after reply
+        TASK_EMOJIS = {"Get", "OneSecond", "OnIt"}
+
+        emojis = self.config.react_emojis
+        fallback = random.choice(emojis)
+
+        try:
+            from litellm import acompletion
+
+            # Load provider config for the cheap model
+            from nanobot.config.loader import load_config
+            cfg = load_config()
+            api_key = cfg.get_api_key("anthropic/claude-haiku-4-5-20251001")
+            api_base = cfg.get_api_base("anthropic/claude-haiku-4-5-20251001")
+
+            if not api_key:
+                # No provider available, use random fallback
+                await self._add_reaction(message_id, fallback)
+                return
+
+            prompt = (
+                f"你是一个AI助手(nanobot)的表情选择器。用户给AI助手发了一条消息，你需要选择一个最合适的表情作为AI助手的即时反应。\n"
+                f"AI助手是一个始终在线、随时待命的bot。如果用户问'在吗'、'是不是重启了'等确认状态的问题，答案通常是肯定的（Yes）。\n\n"
+                f"重要规则:\n"
+                f"- 如果用户在问是非问题（是不是、对不对、有没有等），优先用 Yes 或 No 来回答\n"
+                f"- 如果用户表达感谢，用 THANKS\n"
+                f"- 如果用户在下达简单任务/请求帮忙，用 Get（表示收到了）\n"
+                f"- 如果用户在下达比较复杂的任务，用 OneSecond（表示稍等一下，需要点时间）\n"
+                f"- 如果用户在下达非常复杂的任务（需要大量工作），用 OnIt（表示正在全力处理）\n"
+                f"- 如果用户分享了好消息/成就，用 APPLAUSE 或 TOASTED\n"
+                f"- 其他情况根据语义选择最贴切的表情\n\n"
+                f"可选表情:\n"
+                f"- OK: 好的/知道了（回应通知或信息）\n"
+                f"- THUMBSUP: 点赞/不错（表示认可）\n"
+                f"- THANKS: 感谢/谢谢\n"
+                f"- APPLAUSE: 鼓掌/厉害（赞叹成就）\n"
+                f"- JIAYI: +1/同意（表示赞同观点）\n"
+                f"- DONE: 完成/搞定\n"
+                f"- FACEPALM: 无语/尴尬/离谱\n"
+                f"- SOB: 哭/难过/惨\n"
+                f"- TOASTED: 干杯/庆祝\n"
+                f"- TRICK: 搞怪/有趣/好玩\n"
+                f"- YouAreTheBest: 回复打招呼或者赞美认同\n"
+                f"- Get: 收到/了解（确认收到简单任务）\n"
+                f"- OneSecond: 稍等/马上处理（收到较复杂的任务）\n"
+                f"- OnIt: 在做了/正在全力处理（收到非常复杂的任务）\n"
+                f"- Yes: 是的/对的（肯定回答是非问题）\n"
+                f"- No: 不是/不对（否定回答是非问题）\n\n"
+                f"用户消息: {message_text[:200]}\n\n"
+                f"只回复一个表情名称，不要有其他内容。"
+            )
+
+            kwargs: dict = {
+                "model": "anthropic/claude-haiku-4-5-20251001",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 20,
+                "temperature": 0.8,
+                "api_key": api_key,
+            }
+            if api_base:
+                kwargs["api_base"] = api_base
+
+            response = await acompletion(**kwargs)
+            chosen = response.choices[0].message.content.strip()
+
+            # Validate the response is one of the allowed emojis
+            if chosen in emojis:
+                emoji = chosen
+            else:
+                # Try case-insensitive match
+                emoji_map = {e.lower(): e for e in emojis}
+                emoji = emoji_map.get(chosen.lower(), fallback)
+
+            logger.debug("LLM picked emoji {} for message: {}", emoji, message_text[:50])
+            reaction_id = await self._add_reaction(message_id, emoji)
+
+            # Track task emojis for cleanup after reply
+            if emoji in TASK_EMOJIS and reaction_id:
+                self._pending_task_reactions[message_id] = (emoji, reaction_id)
+                logger.debug("Tracking task reaction {} for message {} (will remove after reply)", emoji, message_id)
+
+        except Exception as e:
+            logger.warning("LLM emoji pick failed ({}), using fallback {}", e, fallback)
+            await self._add_reaction(message_id, fallback)
+
+    async def _finalize_reaction(self, message_id: str, reply_content: str) -> None:
+        """After sending the final reply, clean up task reactions and optionally add DONE.
+        
+        If the initial reaction was a task emoji (Get/OneSecond/OnIt):
+        1. Delete the task emoji
+        2. Use LLM to judge whether to add DONE based on the reply content
+        """
+        pending = self._pending_task_reactions.pop(message_id, None)
+        if not pending:
             return
 
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._add_reaction_sync, message_id, emoji_type)
+        emoji_type, reaction_id = pending
+        logger.debug("Finalizing reaction for message {}: removing {} ({})", message_id, emoji_type, reaction_id)
 
+        # Delete the task emoji
+        await self._delete_reaction(message_id, reaction_id)
+
+        # Use LLM to decide whether to add DONE
+        try:
+            from litellm import acompletion
+            from nanobot.config.loader import load_config
+            cfg = load_config()
+            api_key = cfg.get_api_key("anthropic/claude-haiku-4-5-20251001")
+            api_base = cfg.get_api_base("anthropic/claude-haiku-4-5-20251001")
+
+            if not api_key:
+                return
+
+            prompt = (
+                f"AI助手刚刚完成了一个任务并发送了回复。根据回复内容判断是否应该贴一个 DONE（完成）表情。\n\n"
+                f"规则:\n"
+                f"- 如果回复表明任务已成功完成，回复 YES\n"
+                f"- 如果回复是提问、澄清、拒绝、或表示无法完成，回复 NO\n"
+                f"- 如果回复只是简单的对话/闲聊（非任务），回复 NO\n\n"
+                f"回复内容（前500字）: {reply_content[:500]}\n\n"
+                f"只回复 YES 或 NO。"
+            )
+
+            kwargs: dict = {
+                "model": "anthropic/claude-haiku-4-5-20251001",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 10,
+                "temperature": 0.0,
+                "api_key": api_key,
+            }
+            if api_base:
+                kwargs["api_base"] = api_base
+
+            response = await acompletion(**kwargs)
+            decision = response.choices[0].message.content.strip().upper()
+
+            if decision == "YES":
+                await self._add_reaction(message_id, "DONE")
+                logger.debug("Added DONE reaction to message {} after task completion", message_id)
+            else:
+                logger.debug("Skipped DONE reaction for message {} (decision: {})", message_id, decision)
+
+        except Exception as e:
+            logger.warning("Failed to finalize reaction for message {}: {}", message_id, e)
+    
     # Regex to match markdown tables (header + separator + data rows)
     _TABLE_RE = re.compile(
         r"((?:^[ \t]*\|.+\|[ \t]*\n)(?:^[ \t]*\|[-:\s|]+\|[ \t]*\n)(?:^[ \t]*\|.+\|[ \t]*\n?)+)",
@@ -627,6 +817,9 @@ class FeishuChannel(BaseChannel):
             logger.warning("Feishu client not initialized")
             return
 
+        # Skip reaction finalization for progress messages
+        is_progress = msg.metadata.get("_progress", False)
+
         try:
             receive_id_type = "chat_id" if msg.chat_id.startswith("oc_") else "open_id"
             loop = asyncio.get_running_loop()
@@ -658,6 +851,12 @@ class FeishuChannel(BaseChannel):
                     None, self._send_message_sync,
                     receive_id_type, msg.chat_id, "interactive", json.dumps(card, ensure_ascii=False),
                 )
+
+            # After sending final reply, finalize task reactions (remove Get/OneSecond/OnIt, maybe add DONE)
+            if not is_progress:
+                original_message_id = msg.metadata.get("message_id")
+                if original_message_id and original_message_id in self._pending_task_reactions:
+                    asyncio.create_task(self._finalize_reaction(original_message_id, msg.content or ""))
 
         except Exception as e:
             logger.error("Error sending Feishu message: {}", e)
@@ -696,8 +895,14 @@ class FeishuChannel(BaseChannel):
             chat_type = message.chat_type
             msg_type = message.message_type
 
-            # Add reaction
-            await self._add_reaction(message_id, self.config.react_emoji)
+            # Add reaction (LLM-picked emoji, runs in background)
+            # Extract text preview for emoji selection
+            try:
+                preview_json = json.loads(message.content) if message.content else {}
+            except json.JSONDecodeError:
+                preview_json = {}
+            preview_text = preview_json.get("text", "") or message.content or ""
+            asyncio.create_task(self._pick_and_react(message_id, preview_text))
 
             # Parse content
             content_parts = []
